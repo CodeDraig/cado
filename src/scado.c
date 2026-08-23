@@ -1,385 +1,286 @@
-/* 
- * scado: setuid in capability sauce.
- * Copyright (C) 2016  Davide Berardi, University of Bologna
- * 
- * This file is part of cado.
+/*
+ * scado: manage per-user executable capability authorization files
+ * Copyright (C) 2016 Davide Berardi, University of Bologna
  *
- * Cado is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License
- * as published by the Free Software Foundation; either version 2
- * of the License, or (at your option) any later version.
- * 
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- * 
- * You should have received a copy of the GNU General Public License
- * along with this program; If not, see <http://www.gnu.org/licenses/>. 
- *
+ * This file is part of cado and is distributed under the GNU GPL v2 or later.
  */
 
-#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <getopt.h>
+#include <libgen.h>
+#include <limits.h>
+#include <pwd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <getopt.h>
 #include <unistd.h>
-#include <libgen.h>
-#include <limits.h>
-#include <fcntl.h>
 
-#include <pwd.h>
-#include <errno.h>
-#include <sys/types.h>
-#include <sys/wait.h>
+#include <security/pam_appl.h>
 
-#include <file_utils.h>
-#include <pam_check.h>
-#include <get_scado_file.h>
-
-#include <cado_paths.h>
 #include <cado_const.h>
-#include <scado_parse.h>
-#include <compute_digest.h>
 #include <config.h>
+#include <file_utils.h>
+#include <get_scado_file.h>
+#include <pam_check.h>
+#include <scado_edit.h>
+#include <scado_parse.h>
 
-#include <execs.h>
+#define SCADO_SUCCESS 0
+#define SCADO_ERROR 255
+#define SCADO_AUTH_ERROR 254
 
-#define EDIT_PAM_MAXTRIES 3
+enum scado_action {
+	SCADO_ACTION_NONE = 0,
+	SCADO_ACTION_UPDATE_PATH,
+	SCADO_ACTION_UPDATE_ALL,
+	SCADO_ACTION_DELETE,
+	SCADO_ACTION_LIST,
+	SCADO_ACTION_EDIT
+};
 
-#define SUCCESS 0
+struct scado_request {
+	enum scado_action action;
+	const char *path;
+};
 
-/* Generic error */
-#define ERROR_EXIT -1
-
-/* Authentication error */
-#define ERROR_AUTH -2
-
-const char *tmpdir;
-
-#define OPTSTRING "hu:UDle"
-struct option long_options[] = {
+static const struct option long_options[] = {
 	{"help",       no_argument,       NULL, 'h'},
 	{"update",     required_argument, NULL, 'u'},
 	{"update-all", no_argument,       NULL, 'U'},
 	{"delete",     no_argument,       NULL, 'D'},
 	{"list",       no_argument,       NULL, 'l'},
 	{"edit",       no_argument,       NULL, 'e'},
+	{0, 0, 0, 0}
 };
 
-enum scado_option {none, update, delete, list, edit, toomany};
-
-void usage_n_exit(char *progname, char *message) {
-	fprintf(stderr, "%s - script cado, setuid in capability sauce\n", progname);
-	fprintf(stderr, "usage: %s OPTIONS\n", progname);
+static int usage(const char *program, const char *message)
+{
+	fprintf(stderr, "%s - manage per-user executable capability authorizations\n",
+			program);
+	fprintf(stderr, "usage: %s OPTIONS\n", program);
 	fprintf(stderr, "Options:\n");
 	fprintf(stderr, "   -h --help               display help message and exit\n");
-	fprintf(stderr, "   -u --update <command>   update the checksum of command\n");
-	fprintf(stderr, "   -U --update-all         update the checksum of all commands\n");
+	fprintf(stderr, "   -u --update <command>   update the digest of an absolute command\n");
+	fprintf(stderr, "   -U --update-all         update all persisted digests\n");
 	fprintf(stderr, "   -D --delete             delete the scado file\n");
 	fprintf(stderr, "   -l --list               print the scado file\n");
 	fprintf(stderr, "   -e --edit               edit the scado file\n");
-	if (message)
-		fprintf(stderr, "\n%s\n",message);
-	exit(ERROR_EXIT);
+	if (message != NULL)
+		fprintf(stderr, "\n%s\n", message);
+	return SCADO_ERROR;
 }
 
-/* watchdog for garbage collection.
-	 the temporary file for scado editing is removed in case of abend */
-static int editor_garbage_collect(char *path) {
-	int checkpipe[2];
-	pid_t childpid;
-	if (pipe(checkpipe))
+static int select_action(struct scado_request *request, enum scado_action action,
+		const char *path)
+{
+	if (request->action != SCADO_ACTION_NONE)
 		return -1;
-	/* Start garbage collector
-	 * Double fork to avoid zombie processes and to remove the temporary file when it is not needed any more */
-	if(!(childpid = fork())) {
-		/* Child */
-		if(!fork()) {
-			/* Grandchild */
-			if (close(checkpipe[1]) == 0 && setsid() > 0) {
-				char c;
-				if (read(checkpipe[0], &c, 1) == 0)
-					unlink(path);
-			}
-			exit(0);
-		} else
-			exit(0);
-	} 
-	waitpid(childpid, NULL, 0);
-	/* (grand) parent */
-	close(checkpipe[0]);
-	return(checkpipe[1]);
-}
-
-static void editor_garbage_collect_do_not_unlink(int fd) {
-	char c = 'K'; // keep it, any other non-null char would fit.
-	int n = write(fd, &c, 1);
-	(void) n;
-}
-
-/* command line selectable functions */
-
-int scado_none_or_toomany(char *progname, char *username, char *program_path) {
-	usage_n_exit(progname, "select exactly one option among: -u -U -D -l -e");
+	request->action = action;
+	request->path = path;
 	return 0;
 }
 
-int scado_delete(char *progname, char *username, char *program_path) {
-	char scado_file[PATH_MAX];
+static int parse_request(int argc, char **argv, struct scado_request *request)
+{
+	int option;
 
-	if (get_scado_file(username, scado_file) < 0)
-		return ERROR_EXIT;
-
-	/* Get the authorization. */
-	if (pam_check(username) != PAM_SUCCESS) {
-		return ERROR_AUTH;
-	}
-
-	return unlink(scado_file);
-}
-
-int scado_update(char *progname, char *username, char *program_path) {
-	char tmp_file[PATH_MAX];
-	char scado_file[PATH_MAX];
-
-	if (get_scado_file(username, scado_file) < 0)
-		return ERROR_EXIT;
-
-	/* Get the authorization. */
-	if (pam_check(username) != PAM_SUCCESS) {
-		return ERROR_AUTH;
-	}
-
-	if (snprintf(tmp_file, PATH_MAX, "%s/%s", tmpdir, TMP_TEMPLATE) < 0) 
-		return ERROR_EXIT;
-
-	if (copytemp(scado_file, tmp_file) < 0)
-		return ERROR_EXIT;
-
-	scado_copy_update(tmp_file, scado_file, program_path);
-
-	if (unlink(tmp_file) < 0)
-		return ERROR_EXIT;
-
-	return SUCCESS;
-}
-
-int scado_list(char *progname, char *username, char *program_path) {
-	char scado_file[PATH_MAX];
-	int fd;
-	int outfl = fcntl(STDOUT_FILENO, F_GETFL, 0);
-	if (outfl & O_APPEND)
-		fcntl(STDOUT_FILENO, F_SETFL, outfl & ~O_APPEND);
-
-	if (get_scado_file(username, scado_file) < 0)
-		return ERROR_EXIT;
-
-	if ((fd = open(scado_file, O_RDONLY)) < 0)
-		return fd;
-
-	copyfile(fd, STDOUT_FILENO);
-
-	close(fd);
-	return SUCCESS;
-}
-
-int scado_edit(char *progname, char *username, char *program_path) {
-	char tmp_file[PATH_MAX];
-	char scado_file[PATH_MAX];
-	char *editor;
-	char *args;
-	int status = 0;
-	pid_t pid, xpid;
-	char digest_before[DIGESTSTRLEN + 1];
-	char digest_after[DIGESTSTRLEN + 1];
-	int garbage_collect_fd;
-
-	/* Ignore signals. */
-	(void) signal(SIGHUP,  SIG_IGN);
-	(void) signal(SIGINT,  SIG_IGN);
-	(void) signal(SIGQUIT, SIG_IGN);
-
-	if (get_scado_file(username, scado_file) < 0)
-		return ERROR_EXIT;
-
-	if (snprintf(tmp_file, PATH_MAX, "%s/%s", tmpdir, TMP_TEMPLATE) < 0) 
-		return ERROR_EXIT;
-
-	if (copytemp_digest(scado_file, tmp_file, digest_before) < 0) {
-		*digest_before = 0;
-		if (errno == ENOENT) {
-			int tmpfd=mkstemp(tmp_file);
-			if (tmpfd < 0)
-				return ERROR_EXIT;
-			if (write(tmpfd, DEFAULT_MESSAGE, sizeof(DEFAULT_MESSAGE)-1) < 0)
-				return ERROR_EXIT;
-			close(tmpfd);
-		} else
-			return ERROR_EXIT;
-	}
-
-	garbage_collect_fd = editor_garbage_collect(tmp_file);
-
-	/* Get the editor from the configuration. */
-	if (((editor = getenv("VISUAL")) == NULL || *editor == '\0') &&
-			((editor = getenv("EDITOR")) == NULL || *editor == '\0')) {
-		editor = EDITOR;
-	}
-
-	switch (pid = fork()) {
-		case -1:
-			perror("fork");
-			exit(ERROR_EXIT);
-		case 0:
-			/* XXX secure? */
-			if (setgid(getgid()) < 0) {
-				perror("setgid(getgid())");
-				exit(ERROR_EXIT);
-			}
-			if (setuid(getuid()) < 0) {
-				perror("setuid(getuid())");
-				exit(ERROR_EXIT);
-			}
-
-			if (asprintf(&args, "%s %s", editor, tmp_file) < 0) {
-				exit(ERROR_EXIT);
-			}
-
-			execsp(args);
-			perror(editor);
-			exit(ERROR_EXIT);
+	memset(request, 0, sizeof(*request));
+	opterr = 0;
+	while ((option = getopt_long(argc, argv, "hu:UDle", long_options, NULL)) >= 0) {
+		switch (option) {
+		case 'h':
+			return 1;
+		case 'u':
+			if (optarg[0] != '/' || select_action(request,
+					SCADO_ACTION_UPDATE_PATH, optarg) < 0)
+				return -1;
+			break;
+		case 'U':
+			if (select_action(request, SCADO_ACTION_UPDATE_ALL, NULL) < 0)
+				return -1;
+			break;
+		case 'D':
+			if (select_action(request, SCADO_ACTION_DELETE, NULL) < 0)
+				return -1;
+			break;
+		case 'l':
+			if (select_action(request, SCADO_ACTION_LIST, NULL) < 0)
+				return -1;
+			break;
+		case 'e':
+			if (select_action(request, SCADO_ACTION_EDIT, NULL) < 0)
+				return -1;
+			break;
 		default:
-			/* parent */
-			break;
-	}
-	/* parent */
-	for (;;) {
-		xpid = waitpid(pid, &status, 0);
-		if (xpid == -1) {
-			if(errno != EINTR) {
-				fprintf(stderr, "wait pid: error waiting for PID %ld (%s): %s \n",
-						(long) xpid, editor, strerror(errno));
-				return ERROR_EXIT;
-			}
-		}
-		else if (WIFEXITED(status) && WEXITSTATUS(status)) {
-			fprintf(stderr,"wait pid: exit status");
-			return ERROR_EXIT;
-		}
-		else if(WIFSIGNALED(status)) {
-			fprintf(stderr, "%s killed: signal %d (%score dumped)\n",
-					editor, WTERMSIG(status), WCOREDUMP(status) ? "": "no ");
-		}
-		else {
-			break;
+			return -1;
 		}
 	}
-
-	/* Restore signals. */
-	(void) signal(SIGHUP,  SIG_DFL);
-	(void) signal(SIGINT,  SIG_DFL);
-	(void) signal(SIGQUIT, SIG_DFL);
-
-	if(compute_digest(tmp_file, digest_after) < 0)
-	 return ERROR_EXIT;
-
-	if (strcmp(digest_before, digest_after) != 0) {
-		int count;
-
-		/* Get the authorization. */
-		for (count = 0; count < EDIT_PAM_MAXTRIES; count++) {
-			if (pam_check(username) == PAM_SUCCESS) {
-				break;
-			}
-			if (count < EDIT_PAM_MAXTRIES - 1)
-				fprintf(stderr, "PAM authorization failed\n");
-			else {
-				editor_garbage_collect_do_not_unlink(garbage_collect_fd);
-				fprintf(stderr, "A copy of the edited scado file has been saved as %s\n", tmp_file);
-				return ERROR_AUTH;
-			}
-		}
-		scado_copy_update(tmp_file, scado_file, NULL);
-	}
-
-	close(garbage_collect_fd);
-	return SUCCESS;
+	if (optind != argc || request->action == SCADO_ACTION_NONE)
+		return -1;
+	return 0;
 }
 
-typedef int (* option_function) (char *progname, char *username, char *program_path);
+static int scado_list(const char *username)
+{
+	char path[PATH_MAX];
+	int input;
+	struct cado_io_result copy_result;
+	int close_error = 0;
 
-/* array to select the requested option */
-option_function option_map[] = {
-	scado_none_or_toomany, 
-	scado_update, 
-	scado_delete, 
-	scado_list, 
-	scado_edit, 
-	scado_none_or_toomany};
+	if (get_scado_file(username, path) < 0) {
+		errno = ENAMETOOLONG;
+		return SCADO_ERROR;
+	}
+	input = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+	if (input < 0)
+		return SCADO_ERROR;
+	copy_result = cado_copy_fd(input, STDOUT_FILENO);
+	if (close(input) < 0)
+		close_error = errno;
+	if (copy_result.status != CADO_IO_OK) {
+		errno = copy_result.error_number;
+		return SCADO_ERROR;
+	}
+	if (close_error != 0) {
+		errno = close_error;
+		return SCADO_ERROR;
+	}
+	return SCADO_SUCCESS;
+}
 
-/* update the chosen option. If one was already chosen, switch to "toomany" */
-static inline enum scado_option set_option(enum scado_option option, enum scado_option newvalue) {
-	return option == none ? newvalue : toomany;
+static int scado_delete(const char *username)
+{
+	char path[PATH_MAX];
+	struct scado_file_result result;
+
+	if (get_scado_file(username, path) < 0) {
+		errno = ENAMETOOLONG;
+		return SCADO_ERROR;
+	}
+	if (pam_check(username) != PAM_SUCCESS)
+		return SCADO_AUTH_ERROR;
+	result = scado_delete_transaction(path);
+	if (result.status == SCADO_FILE_OK)
+		return SCADO_SUCCESS;
+	scado_report_file_failure(&result);
+	errno = result.error_number != 0 ? result.error_number : EIO;
+	return SCADO_ERROR;
+}
+
+static int scado_update(const char *username, const struct scado_request *request)
+{
+	char path[PATH_MAX];
+	struct scado_transaction_request transaction;
+	struct scado_file_result result;
+
+	if (get_scado_file(username, path) < 0) {
+		errno = ENAMETOOLONG;
+		return SCADO_ERROR;
+	}
+	if (pam_check(username) != PAM_SUCCESS)
+		return SCADO_AUTH_ERROR;
+	memset(&transaction, 0, sizeof(transaction));
+	transaction.source_path = path;
+	transaction.destination_path = path;
+	transaction.operation.kind = request->action == SCADO_ACTION_UPDATE_PATH ?
+			SCADO_UPDATE_PATH : SCADO_UPDATE_ALL;
+	transaction.operation.path = request->path;
+	transaction.source.kind = SCADO_SOURCE_CURRENT;
+	transaction.destination.kind = SCADO_DESTINATION_SOURCE_SNAPSHOT;
+	result = scado_update_transaction(&transaction);
+	if (result.status != SCADO_FILE_OK) {
+		scado_report_file_failure(&result);
+		errno = result.error_number != 0 ? result.error_number : EIO;
+		return SCADO_ERROR;
+	}
+	return SCADO_SUCCESS;
+}
+
+static int scado_edit(const char *username, const char *temporary_directory)
+{
+	char protected_path[PATH_MAX];
+	const char *editor;
+	struct scado_edit_request request;
+	struct scado_edit_result result;
+
+	if (get_scado_file(username, protected_path) < 0) {
+		errno = ENAMETOOLONG;
+		return SCADO_ERROR;
+	}
+	editor = getenv("VISUAL");
+	if (editor == NULL || editor[0] == '\0')
+		editor = getenv("EDITOR");
+	if (editor == NULL || editor[0] == '\0')
+		editor = EDITOR;
+	request.username = username;
+	request.protected_path = protected_path;
+	request.temporary_directory = temporary_directory;
+	request.editor = editor;
+	result = scado_edit_execute(&request);
+	if (result.status == SCADO_EDIT_OK)
+		return SCADO_SUCCESS;
+	if (result.status == SCADO_EDIT_AUTH_ERROR)
+		return SCADO_AUTH_ERROR;
+	errno = result.error_number != 0 ? result.error_number : EIO;
+	return SCADO_ERROR;
+}
+
+static char *current_username(void)
+{
+	struct passwd *password = getpwuid(getuid());
+
+	return password == NULL ? NULL : strdup(password->pw_name);
 }
 
 int main(int argc, char **argv)
 {
-	struct passwd *pw;
-	char *progname = basename(argv[0]);
+	const char *program = basename(argv[0]);
+	struct scado_request request;
 	char *username;
-	char *program_path = ""; /* "" means ALL */
-	enum scado_option option=none;
+	const char *temporary_directory;
+	int parse_status;
+	int result;
 
-	int rval = 1;
+	parse_status = parse_request(argc, argv, &request);
+	if (parse_status > 0)
+		return usage(program, NULL);
+	if (parse_status < 0)
+		return usage(program,
+				"select exactly one option; -u requires an absolute path and no trailing operands are accepted");
 
-	if ((pw = getpwuid(getuid())) ==  NULL) {
+	username = current_username();
+	if (username == NULL) {
 		fprintf(stderr, "Your UID isn't in the passwd file.\n");
-		exit(ERROR_EXIT);
+		return SCADO_ERROR;
 	}
-	username = pw->pw_name;
+	temporary_directory = getenv("TMPDIR");
+	if (temporary_directory == NULL || temporary_directory[0] == '\0')
+		temporary_directory = TMPDIR;
 
-	if ((tmpdir = getenv("TMPDIR")) == NULL || *tmpdir== '\0') {
-		tmpdir = TMPDIR;
+	switch (request.action) {
+	case SCADO_ACTION_UPDATE_PATH:
+	case SCADO_ACTION_UPDATE_ALL:
+		result = scado_update(username, &request);
+		break;
+	case SCADO_ACTION_DELETE:
+		result = scado_delete(username);
+		break;
+	case SCADO_ACTION_LIST:
+		result = scado_list(username);
+		break;
+	case SCADO_ACTION_EDIT:
+		result = scado_edit(username, temporary_directory);
+		break;
+	case SCADO_ACTION_NONE:
+	default:
+		result = SCADO_ERROR;
+		break;
 	}
-
-	while(1) {
-		int c = getopt_long(argc, argv, OPTSTRING, long_options, NULL);
-		if (c < 0)
-			break;
-		switch(c) {
-			case 'h':
-				usage_n_exit(progname, NULL);
-				break;
-			case 'u':
-				program_path = optarg;
-			case 'U':
-				option=set_option(option,update);
-				break;
-			case 'D':
-				option=set_option(option,delete);
-				break;
-			case 'l':
-				option=set_option(option,list);
-				break;
-			case 'e':
-				option=set_option(option,edit);
-				break;
-			default:
-				usage_n_exit(progname, NULL);
-		}
-	}
-	if (optind != argc) /* unknown trailing arguments */
-		usage_n_exit(progname, "unknown trailing arguments");
-
-	rval = option_map[option](progname, username, program_path);
-
-	if (rval == ERROR_AUTH) {
-		fprintf(stderr, "%s: Authorization failure.\n", progname);
-	} else if (rval) {
-		fprintf(stderr, "%s returned: %d, %s\n", progname, rval, strerror(errno));
-	}
-
-	return rval;
+	if (result == SCADO_AUTH_ERROR)
+		fprintf(stderr, "%s: Authorization failure.\n", program);
+	else if (result != SCADO_SUCCESS)
+		fprintf(stderr, "%s: %s\n", program, strerror(errno));
+	free(username);
+	return result;
 }

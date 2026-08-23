@@ -1,52 +1,54 @@
-.TH CADO.CONF 5 "June 23, 2016" "VirtualSquare Labs"
+.TH CADO.CONF 5 "August 23, 2026" "VirtualSquare Labs"
 .SH NAME
-cado.conf \- Capability Ambient DO: configuration file
-
+cado.conf \- cado capability authorization configuration
 .SH DESCRIPTION
-The \fB/etc/cado.conf\fR file is used to configure which ambient cabalities can be provided by \fBcado\fR to users.
-\fBcado\fR uses the capability cap_dac_read_search to access \fB/etc/cado.conf\fR, so this configuration does not
-need to be readable by users.
-
-All lines beginning with the sign '#' are comments.
-
-Non-comment lines have the following syntax
+.I /etc/cado.conf
+defines which ambient capabilities cado may delegate. The complete file is
+validated before any authorization is returned. A malformed noncomment entry
+prints a file-and-line diagnostic and causes the file to fail closed.
+.PP
+Blank lines and lines whose first non-whitespace character is
+.B #
+are ignored. Every other line is exactly one of:
 .nf
-       \fIlist_of_capabilities\fB:\fI list_of_users_and_groups\fR
+    capability-list : principal-list
+    capability-list : principal-list : condition-sequence
 .fi
-or
+Extra fields and empty required fields are invalid.
+.SH CAPABILITIES
+.I capability-list
+is comma-separated. An item is a libcap capability name, with or without
+.BR cap_ ,
+or an unsigned unprefixed hexadecimal mask. Surrounding whitespace is trimmed.
+Empty lists/items, signs,
+.B 0x
+prefixes, overflow, trailing text, and bits above the supported Linux
+capability range are rejected.
+.SH PRINCIPALS
+.I principal-list
+is a nonempty comma-separated list. An item is a username or a group name
+prefixed by
+.BR @ .
+Empty and whitespace-containing identifiers are invalid.
+.SH CONDITIONS
+.I condition-sequence
+is executed only for a matching identity and relevant capability entry, using
+libexecs 1.4's sequence API. Environment variables are expanded. The condition
+child first drops ambient capabilities. A nonzero condition result denies that
+entry; callback failures therefore deny it as well.
+.SH EXAMPLE
 .nf
-       \fIlist_of_capabilities\fB:\fI list_of_users_and_groups\fB:\fR \fIlist_of_auth_commands\fR
+    # Capability Ambient DO configuration
+    net_admin: @netadmin,renzo
+    cap_kill: renzo
+    setgid,setuid: giovanni: /usr/bin/logger cado identity caps for $USER
+    c0: giovanni,@idgroup
 .fi
-
-Both \fIlist_of_capabilities\fR and \fIlist_of_users_and_groups\fR are comma separated lists of identifiers.
-
-Items of \fIlist_of_capabilities\fR are capability names or capability masks (exadecimal numbers).
-For brevity, the \fBcap_\fR prefix of capability names can be omitted (e.g. \fBnet_admin\fR and \fBcap_net_admin\fR
-have the same meaning).
-
-Items of \fIlist_of_users_and_groups\fR are usernames or groupnames (groupnames must be prefexed by '@').
-
-\fIlist_of_auth_commands\fR is a command or a list of commands separated by semicolon (;). If present, cado runs
-all the sequence of commands it grants the capabilities as defined in the current line only if all return zero as
-their exit status.
-
-Example of \fBcado.conf\fR file:
-
-.nf
-	# Capability Ambient DO configuration file
-	# cado.conf
-	
-	net_admin: @netadmin,renzo: /usr/bin/logger cado net_admin $USER; /bin/echo OK
-	net_admin: @privatenet: /usr/local/lib/cado_autorize_privatenet
-	net_admin,net_bind_service,net_raw,net_broadcast: @vxvdex
-	cap_kill: renzo
-.fi
-
-In this example the renzo's processes can be granted (by \fBcado\fR) cap_net_admin and cap_kill.
-cap_net_admin can be acquired by processes owned by users belonging to the netadmin group.
-Users in vxvdex can provide their processes with a subset of cap_net_admin, cap_net_bind_service, cap_net_raw and cap_net_broadcast
-
+.SH FILES
+.TP
+.I /etc/cado.conf
+Protected system authorization configuration.
 .SH SEE ALSO
-\fBcado\fR(1),
-\fBcaprint\fR(1),
-\fBcapabilities\fR(7)
+.BR cado (1),
+.BR scado (1),
+.BR capabilities (7)

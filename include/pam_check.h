@@ -1,6 +1,6 @@
-#ifndef PAM_CHECK_H
-#define PAM_CHECK_H
-#include <security/pam_appl.h>
+#ifndef CADO_PAM_CHECK_H
+#define CADO_PAM_CHECK_H
 
-int pam_check(char *username);
+int pam_check(const char *username);
+
 #endif

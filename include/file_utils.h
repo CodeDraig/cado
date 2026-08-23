@@ -1,13 +1,24 @@
-#ifndef _FILE_UTILS_H
-#define _FILE_UTILS_H
+#ifndef CADO_FILE_UTILS_H
+#define CADO_FILE_UTILS_H
 
-/* copyfile copies the file infd (from the current offset) to
-	 outfd (from the current offset) */
-/* the return value is the number of bytes copied */
-ssize_t copyfile(int infd, int outfd);
+#include <stddef.h>
+#include <stdint.h>
 
-/* copytemp copies the file whose path is 'inpath' in a temporary file
-	 whose pathname has been created by mkstemp(3) using 'outtemplate; */
-ssize_t copytemp(char *inpath, char *outtemplate);
+enum cado_io_status {
+	CADO_IO_OK = 0,
+	CADO_IO_INVALID_ARGUMENT,
+	CADO_IO_READ,
+	CADO_IO_WRITE
+};
+
+struct cado_io_result {
+	enum cado_io_status status;
+	uint64_t bytes;
+	int error_number;
+};
+
+struct cado_io_result cado_write_all(int descriptor, const void *buffer,
+		size_t length);
+struct cado_io_result cado_copy_fd(int input, int output);
 
 #endif

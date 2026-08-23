@@ -1,46 +1,42 @@
-/* 
- * cado: execute a command in a capability ambient
- * Copyright (C) 2016  Renzo Davoli, University of Bologna
- * 
- * This file is part of cado.
+/*
+ * cado: PAM authentication boundary
+ * Copyright (C) 2016 Renzo Davoli, University of Bologna
  *
- * Cado is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License
- * as published by the Free Software Foundation; either version 2
- * of the License, or (at your option) any later version.
- * 
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- * 
- * You should have received a copy of the GNU General Public License
- * along with this program; If not, see <http://www.gnu.org/licenses/>. 
- *
+ * This file is part of cado and is distributed under the GNU GPL v2 or later.
  */
 
-#define _GNU_SOURCE
-#include <unistd.h>
-#include <sys/types.h>
-#include <security/pam_appl.h> 
-#include <security/pam_misc.h> 
-#include <pwd.h>
+#include <stdio.h>
+#include <security/pam_appl.h>
+#include <security/pam_misc.h>
+
 #include <pam_check.h>
 
-/* call PAM to authorize the current user.
-	 usually this means to prompt the user for a password,
-	 but it can be configured using PAM */
-
-int pam_check(char *username)
+int pam_check(const char *username)
 {
-  pam_handle_t* pamh; 
-  struct pam_conv pamc={.conv=&misc_conv, .appdata_ptr=NULL}; 
-	int rv;
+	pam_handle_t *handle = NULL;
+	struct pam_conv conversation = {
+		.conv = misc_conv,
+		.appdata_ptr = NULL
+	};
+	int authentication;
+	int teardown;
 
-	pam_start ("cado", username, &pamc, &pamh); 
-	rv= pam_authenticate (pamh, 0);
-	pam_end (pamh, 0); 
+	authentication = pam_start("cado", username, &conversation, &handle);
+	if (authentication != PAM_SUCCESS) {
+		fprintf(stderr, "cado: PAM initialization failed with code %d\n",
+				authentication);
+		return authentication;
+	}
 
-  return rv; 
-} 
-
+	authentication = pam_authenticate(handle, 0);
+	if (authentication != PAM_SUCCESS) {
+		fprintf(stderr, "cado: PAM authentication failed: %s\n",
+				pam_strerror(handle, authentication));
+	}
+	teardown = pam_end(handle, authentication);
+	if (teardown != PAM_SUCCESS) {
+		fprintf(stderr, "cado: PAM teardown failed with code %d\n", teardown);
+		return teardown;
+	}
+	return authentication;
+}

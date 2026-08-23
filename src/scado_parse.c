@@ -1,330 +1,924 @@
-/* 
- * cado: execute a command in a capability ambient
- * Copyright (C) 2016  Renzo Davoli and Davide Berardi, University of Bologna
- * 
- * This file is part of cado.
+/*
+ * cado: strict scado parsing and transactional updates
+ * Copyright (C) 2016 Renzo Davoli and Davide Berardi, University of Bologna
  *
- * Cado is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License
- * as published by the Free Software Foundation; either version 2
- * of the License, or (at your option) any later version.
- * 
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- * 
- * You should have received a copy of the GNU General Public License
- * along with this program; If not, see <http://www.gnu.org/licenses/>. 
- *
+ * This file is part of cado and is distributed under the GNU GPL v2 or later.
  */
 
-#include <stdio.h>
-#include <string.h>
 #include <ctype.h>
+#include <errno.h>
 #include <fcntl.h>
-#include <sys/uio.h>
-#include <sys/types.h>
+#include <limits.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/file.h>
 #include <sys/stat.h>
+
+#include <mhash.h>
+
 #include <capset_from_namelist.h>
 #include <compute_digest.h>
+#include <file_utils.h>
+#include <scado_parse.h>
+#include <scado_temp_guard.h>
 
-/* this structure stores the output of the "parsing" of a scado line.
-	 a line has (at most) three colon ":" separated fields.
-	 all field and end pointers are addresses within the string "line".
-	 the i-th field begins at field[i] and terminates just before end[i] */
-	 
-struct scado_line {
-	char *line;
-	char *field[3];
-	char *end[3];
-};
+static struct scado_span trim_span(const char *data, size_t length)
+{
+	struct scado_span span = { .data = data, .length = length };
 
-/* parse a scado line */
-static struct scado_line scado_parse(char *line) {
-	struct scado_line out={line, {NULL, NULL, NULL}, {NULL, NULL, NULL}};
-	char *scan=line;
+	while (span.length > 0 && isspace((unsigned char)*span.data)) {
+		span.data++;
+		span.length--;
+	}
+	while (span.length > 0 &&
+			isspace((unsigned char)span.data[span.length - 1]))
+		span.length--;
+	return span;
+}
+
+static int span_equal_string(struct scado_span span, const char *string)
+{
+	return string != NULL && strlen(string) == span.length &&
+		memcmp(span.data, string, span.length) == 0;
+}
+
+static char *span_string(struct scado_span span)
+{
+	char *string = malloc(span.length + 1);
+
+	if (string == NULL)
+		return NULL;
+	memcpy(string, span.data, span.length);
+	string[span.length] = '\0';
+	return string;
+}
+
+enum scado_parse_status scado_parse_line(const char *line, size_t length,
+		int allow_empty_digest, struct scado_line *parsed)
+{
+	const char *comment;
+	size_t grammar_length;
+	struct scado_span grammar;
+	size_t colons[3];
+	size_t colon_count = 0;
+	size_t i;
+	char *capabilities;
+	enum cado_cap_parse_status cap_status;
+
+	if (line == NULL || parsed == NULL)
+		return SCADO_PARSE_FIELD_COUNT;
+	memset(parsed, 0, sizeof(*parsed));
+	if (memchr(line, '\0', length) != NULL)
+		return SCADO_PARSE_EMBEDDED_NUL;
+	if (length > 0 && line[length - 1] == '\n')
+		length--;
+	comment = memchr(line, '#', length);
+	grammar_length = comment == NULL ? length : (size_t)(comment - line);
+	grammar = trim_span(line, grammar_length);
+	if (grammar.length == 0) {
+		parsed->kind = comment == NULL ? SCADO_LINE_BLANK : SCADO_LINE_COMMENT;
+		return SCADO_PARSE_OK;
+	}
+
+	for (i = 0; i < grammar_length; i++) {
+		if (line[i] == ':') {
+			if (colon_count == 3)
+				return SCADO_PARSE_FIELD_COUNT;
+			colons[colon_count++] = i;
+		}
+	}
+	if (colon_count != 1 && colon_count != 2)
+		return SCADO_PARSE_FIELD_COUNT;
+
+	parsed->kind = SCADO_LINE_ENTRY;
+	parsed->path = trim_span(line, colons[0]);
+	parsed->capabilities = trim_span(line + colons[0] + 1,
+			(colon_count == 2 ? colons[1] : grammar_length) - colons[0] - 1);
+	parsed->has_digest = colon_count == 2;
+	if (parsed->has_digest)
+		parsed->digest = trim_span(line + colons[1] + 1,
+				grammar_length - colons[1] - 1);
+
+	if (parsed->path.length == 0)
+		return SCADO_PARSE_PATH_MISSING;
+	if (parsed->path.data[0] != '/')
+		return SCADO_PARSE_PATH_NOT_ABSOLUTE;
+	capabilities = span_string(parsed->capabilities);
+	if (capabilities == NULL)
+		return SCADO_PARSE_NO_MEMORY;
+	cap_status = capset_from_namelist(capabilities, &parsed->capability_set);
+	free(capabilities);
+	if (cap_status != CADO_CAP_PARSE_OK)
+		return cap_status == CADO_CAP_PARSE_NO_MEMORY ? SCADO_PARSE_NO_MEMORY :
+				SCADO_PARSE_CAPABILITIES;
+
+	if (parsed->has_digest) {
+		if (parsed->digest.length == 0)
+			return allow_empty_digest ? SCADO_PARSE_OK :
+					SCADO_PARSE_DIGEST_EMPTY;
+		if (parsed->digest.length != DIGESTSTRLEN)
+			return SCADO_PARSE_DIGEST_INVALID;
+		for (i = 0; i < parsed->digest.length; i++) {
+			if (!isxdigit((unsigned char)parsed->digest.data[i]))
+				return SCADO_PARSE_DIGEST_INVALID;
+		}
+	}
+	return SCADO_PARSE_OK;
+}
+
+const char *scado_parse_status_string(enum scado_parse_status status)
+{
+	switch (status) {
+	case SCADO_PARSE_OK:
+		return "valid scado line";
+	case SCADO_PARSE_EMBEDDED_NUL:
+		return "embedded NUL byte";
+	case SCADO_PARSE_FIELD_COUNT:
+		return "expected exactly two or three colon-delimited fields";
+	case SCADO_PARSE_PATH_MISSING:
+		return "missing executable path";
+	case SCADO_PARSE_PATH_NOT_ABSOLUTE:
+		return "executable path is not absolute";
+	case SCADO_PARSE_CAPABILITIES:
+		return "invalid capability list";
+	case SCADO_PARSE_DIGEST_EMPTY:
+		return "empty persisted digest";
+	case SCADO_PARSE_DIGEST_INVALID:
+		return "digest must be exactly 64 hexadecimal characters";
+	case SCADO_PARSE_NO_MEMORY:
+		return "out of memory while parsing scado line";
+	}
+	return "unknown scado parse error";
+}
+
+static void render_binary_digest(const unsigned char binary[DIGESTLEN],
+		char ascii[DIGESTSTRLEN + 1])
+{
+	static const char digits[] = "0123456789abcdef";
 	int i;
-	for (i=0; i<3; i++) {
-		while (isspace(*scan)) scan++;
-		out.field[i] = scan;
-		if (*scan == '#' || *scan == 0) goto end;
-		while (*scan != ':') {
-			if (scan[0] == '\\' && scan[1] != 0) scan++;
-			if (*scan == '#' || *scan == 0) goto end;
-			scan++;
-		}
-		out.end[i] = scan;
-		scan++;
+
+	for (i = 0; i < DIGESTLEN; i++) {
+		ascii[i * 2] = digits[binary[i] >> 4];
+		ascii[i * 2 + 1] = digits[binary[i] & 0x0f];
 	}
-	return out;
-end:
-	out.end[i] = scan;
-	return out;
+	ascii[DIGESTSTRLEN] = '\0';
 }
 
-/* true if the current line matches path, false otherwise.
-	 scado_path_match manages the escape chars '\' in the scado line
-	 without any copy */
-static int scado_path_match(const char *path, struct scado_line *line) {
-	char *lpath;
-	for (lpath = line->field[0]; *path && *lpath; path++, lpath++) {
-		if (lpath[0] == '\\' && lpath[1] != 0) lpath++;
-		if (*lpath != *path) 
-			break;
-	}
-	return (*path == 0 && (*lpath == 0 || isspace(*lpath) || *lpath == ':'));
-}
+static int hash_bytes(MHASH hash, const unsigned char *data, size_t length)
+{
+	while (length > 0) {
+		mutils_word32 chunk = length > UINT32_MAX ? UINT32_MAX :
+				(mutils_word32)length;
 
-/* get the capability set from a scado file line */
-static int scado_get_caps(struct scado_line *line, uint64_t *capset) {
-	if (line->field[1]) {
-		size_t caplen = line->end[1] - line->field[1];
-		char caps[caplen+1];
-		strncpy(caps,line->field[1],caplen);
-		caps[caplen]=0;
-		return capset_from_namelist(caps, capset);
-	} else
-		return -1;
-}
-
-/* scado_check_digest_syntax returns:
-	 -1 if the digest field has syntax errors,
-	 0 if it is an ampty field (but the field exists!)
-	 1 if the line has just two fields (one ':') OR there is a well-formed hex digest */
-
-static int scado_check_digest_syntax(struct scado_line *line) {
-	if (line->field[2]) {
-		int i;
-		size_t digestlen = line->end[2] - line->field[2];
-		char digest[digestlen+1];
-		strncpy(digest,line->field[2],digestlen);
-		digest[digestlen]=0;
-		if (*digest == 0)
-			return 0;
-		if (strlen(digest) < DIGESTSTRLEN)
+		if (mhash(hash, data, chunk) != MUTILS_OK)
 			return -1;
-		for (i = 0; i < DIGESTSTRLEN && isxdigit(digest[i]); i++)
-			;
-		if (i < DIGESTSTRLEN)
-			return -1;
-		for (; digest[i] != 0; i++)
-			if (!isspace(digest[i]))
-				return -1;
-		return 1;
-	} else
-		return 1;
+		data += chunk;
+		length -= chunk;
+	}
+	return 0;
 }
 
-/* true if the field exists and it is not empty */
-static inline int fieldok(struct scado_line *line, int i) {
-	return line->field[i] && line->end[i] != line->field[i];
+static enum scado_file_status write_piece(int output, const void *data,
+		size_t length, int *error_number)
+{
+	struct cado_io_result write_result = cado_write_all(output, data, length);
+
+	if (write_result.status == CADO_IO_OK)
+		return SCADO_FILE_OK;
+	*error_number = write_result.error_number;
+	return SCADO_FILE_WRITE;
 }
 
-/* some syntax sanity checks */
-static int scado_syntax_check(char *path, int lineno, struct scado_line *line) {
-	uint64_t capset;
-	int rv=0;
-	if (line->end[2] && line->end[2][0] == ':') {
-		fprintf(stderr,"%s line %d: extra trailing chars\n", path, lineno);
-		rv = -1;
-	}
-	if (fieldok(line, 0) && line->field[0][0] != '/') {
-		fprintf(stderr,"%s line %d: pathname is not absolute\n", path, lineno);
-		rv = -1;
-	}
-	if (fieldok(line, 0) && !fieldok(line, 1)) {
-		fprintf(stderr,"%s line %d: missing capability set\n", path, lineno);
-		rv = -1;
-	}
-	if (fieldok(line, 1) && scado_get_caps(line, &capset) < 0) {
-		fprintf(stderr,"%s line %d: wrong capability syntax\n", path, lineno);
-		rv = -1;
-	}
-	if (fieldok(line, 2) && scado_check_digest_syntax(line) < 0) {
-		fprintf(stderr,"%s line %d: wrong digest syntax\n", path, lineno);
-		rv = -1;
-	}
-	return rv;
-}
-	
-/* clean the path (parsing escape chars) in place */
-static void cleanpath(char *path) {
-	char *out=path;
-	while(*path != 0 && !isspace(*path)) {
-		if (path[0] == '\\' && path[1] != 0) path++;
-		*out++ = *path++;
-	}
-	*out=0;
-}
-	
-/* update a line */
-/* inpath == NULL -> add the digest it if is missing
-	 inpath == "" -> update the digest in any case
-	 inpath == "/....." (a valid path) -> update the digest if the path of this line matches */
-static void scado_update_line(FILE *fout, struct scado_line *line, char *inpath) {
-	if (line->field[2] != NULL) {
-		/* there is the digest field */
-		size_t pathlen = line->end[0] - line->field[0];
-		char path[pathlen+1];
-		/* create a temporary copy of the path on the stack and clean it*/
-		strncpy(path,line->field[0],pathlen);
-		path[pathlen]=0;
-		cleanpath(path);
-		int digestok=scado_check_digest_syntax(line);
-		if (digestok < 0) // do not update in case of syntax error
-			fprintf(fout, "%s\n", line->line);
-		else if (digestok == 0) { //missing digest -> fill in!
-			char digest[DIGESTSTRLEN + 1];
-			int len = line->field[2] - line->line;
-			if (compute_digest(path, digest) < 0)
-				fprintf(fout, "%s\n", line->line);
-			else if (line->end[2] != 0)
-				fprintf(fout,"%*.*s%s %s\n",len,len,line->line,digest,line->end[2]);
-			else 
-				fprintf(fout,"%*.*s%s\n",len,len,line->line,digest);
-		} else if (inpath && (*inpath == 0 || strcmp(path, inpath) == 0)) { /* if ALL or this path */
-			char digest[DIGESTSTRLEN + 1];
-			int len = line->field[2] - line->line;
-			if (compute_digest(path, digest) < 0)
-				fprintf(fout, "%s\n", line->line);
-			else 
-			  fprintf(fout,"%*.*s%s%s\n",len,len,line->line,digest,line->field[2]+DIGESTSTRLEN);
-		} else
-			fprintf(fout, "%s\n", line->line);
-	} else
-		fprintf(fout, "%s\n", line->line);
+static enum scado_file_status write_updated_line(int output, const char *line,
+		size_t length, const struct scado_line *parsed, const char *digest,
+		int *error_number)
+{
+	size_t prefix = (size_t)(parsed->digest.data - line);
+	size_t suffix = prefix + parsed->digest.length;
+	enum scado_file_status status;
+
+	status = write_piece(output, line, prefix, error_number);
+	if (status != SCADO_FILE_OK)
+		return status;
+	status = write_piece(output, digest, DIGESTSTRLEN, error_number);
+	if (status != SCADO_FILE_OK)
+		return status;
+	return write_piece(output, line + suffix, length - suffix, error_number);
 }
 
-/* copy the file from inpath to outpath, updating the digest where required:
-	 path == NULL -> add missing digests
-	 path == "" -> all
-*/
-void scado_copy_update(char *inpath, char *outpath, char *path) {
-	FILE *fin = NULL;
-	mode_t oldmask;
-	FILE *fout;
-	char *line;
-	size_t len=0;
-	int lineno=0;
-	ssize_t n;
-
-	int fdin;
-	struct stat l_stats;
-
-	/* Symlinks check */
-	if ((fdin = open(inpath, O_RDONLY | O_NOFOLLOW)) < 0) {
-		return;
-	}
-
-	if (fstat(fdin, &l_stats) || l_stats.st_mode == S_IFLNK) {
-		return;
-	}
-
-	fin = fdopen(fdin, "r");
-	if (fin == NULL)
-		return;
-	oldmask = umask(077);
-	fout = fopen(outpath, "w");
-	umask(oldmask);
-	if (fout == NULL) {
-		fclose(fin);
-		return;
-	}
-	while ((n = getline(&line, &len, fin)) > 0) {
-		struct scado_line scado_line;
-		line[n-1] = 0;
-		scado_line = scado_parse(line);
-		lineno++;
-		scado_syntax_check(outpath, lineno, &scado_line);
-		scado_update_line(fout, &scado_line, path);
-	}
-	fclose(fin);
-	fclose(fout);
-	free(line);
-}
-
-/* scan the scado file whose pathname is inpath seeking for the line matching with 'path'
-	 scado_path_getinfo returns:
-	 -1 in case of error, 0 if the line is missing, 1 if the line has been found */
-/* if scado_path_getinfo succeeds, pcapset and digest are set to
-	 the set of permitted capabilities and the hash digest, respectively. */
-int scado_path_getinfo(char *inpath, const char *path, uint64_t *pcapset, char *digest) {
-	FILE *fin = fopen(inpath, "r");
-	char *line;
-	size_t len=0;
-	ssize_t n;
-	int lineno=0;
-	int rv = 0;
-	if (fin == NULL)
-		return -1;
-	while ((n = getline(&line, &len, fin)) > 0) {
-		struct scado_line scado_line;
-		line[n-1] = 0;
-		scado_line = scado_parse(line);
-		lineno++;
-		if (scado_path_match(path, &scado_line)) {
-			if (scado_syntax_check(inpath, lineno, &scado_line) == 0) {
-				if (scado_get_caps(&scado_line, pcapset) >= 0) {
-					if (scado_line.field[2]) {
-						int i;
-						for (i = 0; i < DIGESTSTRLEN ; i++) 
-							digest[i] = tolower(scado_line.field[2][i]);
-						digest[i] = 0;
-						rv = 1;
-					} else {
-						digest[0] = 0;
-						rv = 1;
-					}	
-				}
-			}
-			break;
-		}
-	}
-	fclose(fin);
-	free(line);
-	return rv;
-}
-
-#if 0
-int main() {
-	char *line;
-	size_t len=0;
-	struct scado_line s;
-	int lineno=0;
-	while (1) {
-		ssize_t n=getline(&line, &len, stdin);
-		line[n-1]=0;
-		lineno++;
-		s=scado_parse(line);
-		printf("L %s\n",s.line);
-		printf("P %s|%s\n",s.field[0],s.end[0]);
-		printf("C %s|%s\n",s.field[1],s.end[1]);
-		printf("H %s|%s\n",s.field[2],s.end[2]);
-		uint64_t cap=0;
-		printf("%d ",scado_get_caps(&s,&cap));
-		printf("%lx\n",cap);
-		scado_syntax_check(lineno, &s);
-		printf("NULL->");fflush(stdout);
-		scado_update_line(1, &s, NULL);
-		printf("ALL ->");fflush(stdout);
-		scado_update_line(1, &s, "");
-		printf("bash ->");fflush(stdout);
-		scado_update_line(1, &s, "/bin/bash");
-	}
-}
-#endif
-#if 0
-int main(int argc, char *argv[]) {
-	scado_update(argv[1], argv[2], argv[3]);
-}
-#endif
-#if 0
-int main(int argc, char *argv[]) {
+static enum scado_file_status update_line(int output, const char *line,
+		size_t length, const struct scado_line *parsed,
+		const struct scado_update_operation *operation,
+		struct scado_file_result *result)
+{
+	int update_digest = 0;
 	char digest[DIGESTSTRLEN + 1];
-	uint64_t capset;
-	if (scado_path_getinfo(argv[1], argv[2], &capset, digest)) {
-		printf("%lx %s\n",capset,digest);
+	char *path;
+	struct cado_digest_result digest_result;
+
+	if (parsed->kind != SCADO_LINE_ENTRY)
+		return write_piece(output, line, length, &result->error_number);
+
+	switch (operation->kind) {
+	case SCADO_ADD_MISSING:
+		update_digest = parsed->has_digest && parsed->digest.length == 0;
+		break;
+	case SCADO_UPDATE_ALL:
+		update_digest = parsed->has_digest;
+		break;
+	case SCADO_UPDATE_PATH:
+		if (span_equal_string(parsed->path, operation->path)) {
+			result->matched++;
+			if (!parsed->has_digest) {
+				result->error_number = EINVAL;
+				return SCADO_FILE_TARGET_HAS_NO_DIGEST;
+			}
+			update_digest = 1;
+		}
+		break;
+	}
+	if (!update_digest)
+		return write_piece(output, line, length, &result->error_number);
+
+	path = span_string(parsed->path);
+	if (path == NULL) {
+		result->error_number = ENOMEM;
+		return SCADO_FILE_DIGEST;
+	}
+	digest_result = compute_digest(path, digest);
+	free(path);
+	if (digest_result.status != CADO_DIGEST_OK) {
+		result->error_number = digest_result.error_number;
+		return SCADO_FILE_DIGEST;
+	}
+	result->changed++;
+	return write_updated_line(output, line, length, parsed, digest,
+			&result->error_number);
+}
+
+static int destination_directory(const char *destination, char output[PATH_MAX])
+{
+	const char *slash = strrchr(destination, '/');
+	size_t length;
+
+	if (slash == NULL) {
+		output[0] = '.';
+		output[1] = '\0';
+		return 0;
+	}
+	length = slash == destination ? 1 : (size_t)(slash - destination);
+	if (length >= PATH_MAX) {
+		errno = ENAMETOOLONG;
+		return -1;
+	}
+	memcpy(output, destination, length);
+	output[length] = '\0';
+	return 0;
+}
+
+static void cleanup_stage(const char *stage, struct scado_file_result *result)
+{
+	if (*stage != '\0' && unlink(stage) < 0 && errno != ENOENT) {
+		if (result->cleanup_error == 0)
+			result->cleanup_error = errno;
 	}
 }
-#endif
+
+static enum scado_file_status check_destination(
+		const struct scado_transaction_request *request,
+		const char source_digest[DIGESTSTRLEN + 1], int *error_number)
+{
+	struct stat destination_stat;
+	struct cado_digest_result digest_result;
+	char destination_digest[DIGESTSTRLEN + 1];
+	const char *expected_digest;
+
+	if (request->destination.kind == SCADO_DESTINATION_ABSENT) {
+		if (lstat(request->destination_path, &destination_stat) < 0) {
+			if (errno == ENOENT)
+				return SCADO_FILE_OK;
+			*error_number = errno;
+			return SCADO_FILE_OPEN_DESTINATION;
+		}
+		*error_number = ESTALE;
+		return SCADO_FILE_DESTINATION_CHANGED;
+	}
+
+	expected_digest = request->destination.kind ==
+			SCADO_DESTINATION_SOURCE_SNAPSHOT ? source_digest :
+			request->destination.digest;
+	digest_result = compute_digest_nofollow_regular(request->destination_path,
+			destination_digest);
+	if (digest_result.status != CADO_DIGEST_OK) {
+		if ((digest_result.status == CADO_DIGEST_OPEN_INPUT &&
+				(digest_result.error_number == ENOENT ||
+				digest_result.error_number == ELOOP)) ||
+				digest_result.status == CADO_DIGEST_INPUT_NOT_REGULAR) {
+			*error_number = ESTALE;
+			return SCADO_FILE_DESTINATION_CHANGED;
+		}
+		*error_number = digest_result.error_number != 0 ?
+				digest_result.error_number : EIO;
+		return SCADO_FILE_OPEN_DESTINATION;
+	}
+	if (strcasecmp(destination_digest, expected_digest) != 0) {
+		*error_number = ESTALE;
+		return SCADO_FILE_DESTINATION_CHANGED;
+	}
+	return SCADO_FILE_OK;
+}
+
+struct scado_file_result scado_update_transaction(
+		const struct scado_transaction_request *request)
+{
+	struct scado_file_result result = { .status = SCADO_FILE_OK };
+	const char *source_path;
+	const char *destination_path;
+	const struct scado_update_operation *operation;
+	char directory[PATH_MAX];
+	char stage[PATH_MAX] = "";
+	int directory_fd = -1;
+	int source_fd = -1;
+	int stage_fd = -1;
+	FILE *source = NULL;
+	struct stat source_stat;
+	char *line = NULL;
+	size_t capacity = 0;
+	ssize_t length;
+	size_t line_number = 0;
+	MHASH source_hash = MHASH_FAILED;
+	unsigned char binary_digest[DIGESTLEN];
+	char source_digest[DIGESTSTRLEN + 1];
+	struct scado_temp_guard stage_guard;
+	int source_hash_finished = 0;
+	int stage_created = 0;
+	int stage_guard_started = 0;
+	int directory_locked = 0;
+	int rendered;
+
+	if (request == NULL) {
+		result.status = SCADO_FILE_INVALID_ARGUMENT;
+		result.error_number = EINVAL;
+		return result;
+	}
+	source_path = request->source_path;
+	destination_path = request->destination_path;
+	operation = &request->operation;
+	if (source_path == NULL || destination_path == NULL ||
+			operation->kind < SCADO_ADD_MISSING ||
+			operation->kind > SCADO_UPDATE_PATH ||
+			(operation->kind == SCADO_UPDATE_PATH &&
+			(operation->path == NULL || operation->path[0] != '/')) ||
+			request->source.kind < SCADO_SOURCE_CURRENT ||
+			request->source.kind > SCADO_SOURCE_DIGEST ||
+			request->destination.kind < SCADO_DESTINATION_ABSENT ||
+			request->destination.kind > SCADO_DESTINATION_SOURCE_SNAPSHOT) {
+		result.status = SCADO_FILE_INVALID_ARGUMENT;
+		result.error_number = EINVAL;
+		return result;
+	}
+	if ((request->source.kind == SCADO_SOURCE_DIGEST &&
+			!cado_digest_is_valid(request->source.digest)) ||
+			(request->destination.kind == SCADO_DESTINATION_DIGEST &&
+			!cado_digest_is_valid(request->destination.digest))) {
+		result.status = SCADO_FILE_INVALID_ARGUMENT;
+		result.error_number = EINVAL;
+		return result;
+	}
+	if (destination_directory(destination_path, directory) < 0) {
+		result.status = SCADO_FILE_OPEN_DIRECTORY;
+		result.error_number = errno;
+		return result;
+	}
+	if (scado_temp_guard_start(&stage_guard, directory,
+			".cado-stage.XXXXXX") < 0) {
+		result.status = SCADO_FILE_STAGE_GUARD;
+		result.error_number = errno;
+		return result;
+	}
+	stage_guard_started = 1;
+	directory_fd = open(directory, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+	if (directory_fd < 0) {
+		result.status = SCADO_FILE_OPEN_DIRECTORY;
+		result.error_number = errno;
+		goto out;
+	}
+	stage_fd = mkstemp(scado_temp_guard_path(&stage_guard));
+	if (stage_fd < 0) {
+		result.status = SCADO_FILE_CREATE_STAGE;
+		result.error_number = errno;
+		goto out;
+	}
+	stage_created = 1;
+	rendered = snprintf(stage, sizeof(stage), "%s",
+			scado_temp_guard_path(&stage_guard));
+	if (rendered < 0 || (size_t)rendered >= sizeof(stage)) {
+		result.status = SCADO_FILE_CREATE_STAGE;
+		result.error_number = ENAMETOOLONG;
+		goto out;
+	}
+	if (fcntl(stage_fd, F_SETFD, FD_CLOEXEC) < 0) {
+		result.status = SCADO_FILE_SET_CLOEXEC;
+		result.error_number = errno;
+		goto out;
+	}
+	if (fchmod(stage_fd, 0600) < 0) {
+		result.status = SCADO_FILE_SET_MODE;
+		result.error_number = errno;
+		goto out;
+	}
+
+	source_fd = open(source_path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+	if (source_fd < 0) {
+		result.status = SCADO_FILE_OPEN_SOURCE;
+		result.error_number = errno;
+		goto out;
+	}
+	if (fstat(source_fd, &source_stat) < 0) {
+		result.status = SCADO_FILE_SOURCE_STAT;
+		result.error_number = errno;
+		goto out;
+	}
+	if (!S_ISREG(source_stat.st_mode)) {
+		result.status = SCADO_FILE_SOURCE_NOT_REGULAR;
+		result.error_number = EINVAL;
+		goto out;
+	}
+	source = fdopen(source_fd, "r");
+	if (source == NULL) {
+		result.status = SCADO_FILE_OPEN_SOURCE;
+		result.error_number = errno;
+		goto out;
+	}
+	source_fd = -1;
+
+	if (mhash_get_block_size(MHASH_SHA256) != DIGESTLEN) {
+		result.status = SCADO_FILE_HASH_INIT;
+		result.error_number = EINVAL;
+		goto out;
+	}
+	source_hash = mhash_init(MHASH_SHA256);
+	if (source_hash == MHASH_FAILED) {
+		result.status = SCADO_FILE_HASH_INIT;
+		result.error_number = ENOMEM;
+		goto out;
+	}
+	while ((length = getline(&line, &capacity, source)) >= 0) {
+		struct scado_line parsed;
+		enum scado_parse_status parse_status;
+
+		line_number++;
+		if (hash_bytes(source_hash, (const unsigned char *)line,
+				(size_t)length) < 0) {
+			result.status = SCADO_FILE_HASH_UPDATE;
+			result.error_number = EIO;
+			goto out;
+		}
+		parse_status = scado_parse_line(line, (size_t)length,
+				operation->kind == SCADO_ADD_MISSING, &parsed);
+		if (parse_status != SCADO_PARSE_OK) {
+			fprintf(stderr, "%s:%zu: %s\n", source_path, line_number,
+					scado_parse_status_string(parse_status));
+			result.status = SCADO_FILE_PARSE;
+			result.error_number = EINVAL;
+			result.line = line_number;
+			goto out;
+		}
+		result.status = update_line(stage_fd, line, (size_t)length, &parsed,
+				operation, &result);
+		if (result.status != SCADO_FILE_OK) {
+			result.line = line_number;
+			goto out;
+		}
+	}
+	if (ferror(source)) {
+		result.status = SCADO_FILE_READ;
+		result.error_number = errno != 0 ? errno : EIO;
+		result.line = line_number + 1;
+		goto out;
+	}
+	if (operation->kind == SCADO_UPDATE_PATH && result.matched == 0) {
+		result.status = SCADO_FILE_TARGET_MISSING;
+		result.error_number = ENOENT;
+		goto out;
+	}
+	mhash_deinit(source_hash, binary_digest);
+	source_hash_finished = 1;
+	render_binary_digest(binary_digest, source_digest);
+	if (request->source.kind == SCADO_SOURCE_DIGEST &&
+			strcasecmp(source_digest, request->source.digest) != 0) {
+		result.status = SCADO_FILE_SOURCE_CHANGED;
+		result.error_number = ESTALE;
+		goto out;
+	}
+	if (fsync(stage_fd) < 0) {
+		result.status = SCADO_FILE_SYNC_STAGE;
+		result.error_number = errno;
+		goto out;
+	}
+	if (fclose(source) != 0) {
+		source = NULL;
+		result.status = SCADO_FILE_CLOSE_SOURCE;
+		result.error_number = errno;
+		goto out;
+	}
+	source = NULL;
+	if (close(stage_fd) < 0) {
+		stage_fd = -1;
+		result.status = SCADO_FILE_CLOSE_STAGE;
+		result.error_number = errno;
+		goto out;
+	}
+	stage_fd = -1;
+	if (flock(directory_fd, LOCK_EX) < 0) {
+		result.status = SCADO_FILE_LOCK_DIRECTORY;
+		result.error_number = errno;
+		goto out;
+	}
+	directory_locked = 1;
+	result.status = check_destination(request, source_digest,
+			&result.error_number);
+	if (result.status != SCADO_FILE_OK)
+		goto out;
+	if (rename(stage, destination_path) < 0) {
+		result.status = SCADO_FILE_RENAME;
+		result.error_number = errno;
+		goto out;
+	}
+	stage_created = 0;
+	result.committed = 1;
+	if (fsync(directory_fd) < 0) {
+		result.status = SCADO_FILE_SYNC_DIRECTORY;
+		result.error_number = errno;
+		goto out;
+	}
+	if (flock(directory_fd, LOCK_UN) < 0) {
+		result.status = SCADO_FILE_UNLOCK_DIRECTORY;
+		result.error_number = errno;
+		goto out;
+	}
+	directory_locked = 0;
+
+out:
+	if (directory_locked && flock(directory_fd, LOCK_UN) < 0) {
+		if (result.status == SCADO_FILE_OK) {
+			result.status = SCADO_FILE_UNLOCK_DIRECTORY;
+			result.error_number = errno;
+		} else if (result.cleanup_error == 0) {
+			result.cleanup_error = errno;
+		}
+	}
+	if (source_hash != MHASH_FAILED && !source_hash_finished)
+		mhash_deinit(source_hash, binary_digest);
+	free(line);
+	if (source != NULL && fclose(source) != 0) {
+		if (result.status == SCADO_FILE_OK) {
+			result.status = SCADO_FILE_CLOSE_SOURCE;
+			result.error_number = errno;
+		} else if (result.cleanup_error == 0) {
+			result.cleanup_error = errno;
+		}
+	}
+	if (source_fd >= 0 && close(source_fd) < 0) {
+		if (result.status == SCADO_FILE_OK) {
+			result.status = SCADO_FILE_CLOSE_SOURCE;
+			result.error_number = errno;
+		} else if (result.cleanup_error == 0) {
+			result.cleanup_error = errno;
+		}
+	}
+	if (stage_fd >= 0 && close(stage_fd) < 0) {
+		if (result.status == SCADO_FILE_OK) {
+			result.status = SCADO_FILE_CLOSE_STAGE;
+			result.error_number = errno;
+		} else if (result.cleanup_error == 0) {
+			result.cleanup_error = errno;
+		}
+	}
+	if (stage_guard_started) {
+		enum scado_temp_disposition disposition = result.committed ?
+				SCADO_TEMP_TRANSFER : SCADO_TEMP_DISCARD;
+
+		if (scado_temp_guard_finish(&stage_guard, disposition) < 0) {
+			if (result.status == SCADO_FILE_OK) {
+				result.status = SCADO_FILE_STAGE_GUARD;
+				result.error_number = errno;
+			} else if (result.cleanup_error == 0) {
+				result.cleanup_error = errno;
+			}
+		} else if (!result.committed) {
+			stage_created = 0;
+		}
+	}
+	if (stage_created)
+		cleanup_stage(stage, &result);
+	if (directory_fd >= 0 && close(directory_fd) < 0) {
+		if (result.status == SCADO_FILE_OK) {
+			result.status = SCADO_FILE_CLOSE_DIRECTORY;
+			result.error_number = errno;
+		} else if (result.cleanup_error == 0) {
+			result.cleanup_error = errno;
+		}
+	}
+	return result;
+}
+
+struct scado_file_result scado_validate_file(const char *path)
+{
+	struct scado_file_result result = { .status = SCADO_FILE_OK };
+	int descriptor = -1;
+	struct stat stats;
+	FILE *input = NULL;
+	char *line = NULL;
+	size_t capacity = 0;
+	ssize_t length;
+	size_t line_number = 0;
+
+	if (path == NULL) {
+		result.status = SCADO_FILE_INVALID_ARGUMENT;
+		result.error_number = EINVAL;
+		return result;
+	}
+	descriptor = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+	if (descriptor < 0) {
+		result.status = SCADO_FILE_OPEN_SOURCE;
+		result.error_number = errno;
+		return result;
+	}
+	if (fstat(descriptor, &stats) < 0) {
+		result.status = SCADO_FILE_SOURCE_STAT;
+		result.error_number = errno;
+		goto out;
+	}
+	if (!S_ISREG(stats.st_mode)) {
+		result.status = SCADO_FILE_SOURCE_NOT_REGULAR;
+		result.error_number = EINVAL;
+		goto out;
+	}
+	input = fdopen(descriptor, "r");
+	if (input == NULL) {
+		result.status = SCADO_FILE_OPEN_SOURCE;
+		result.error_number = errno;
+		goto out;
+	}
+	descriptor = -1;
+	while ((length = getline(&line, &capacity, input)) >= 0) {
+		struct scado_line parsed;
+		enum scado_parse_status parse_status;
+
+		line_number++;
+		parse_status = scado_parse_line(line, (size_t)length, 0, &parsed);
+		if (parse_status != SCADO_PARSE_OK) {
+			fprintf(stderr, "%s:%zu: %s\n", path, line_number,
+					scado_parse_status_string(parse_status));
+			result.status = SCADO_FILE_PARSE;
+			result.error_number = EINVAL;
+			result.line = line_number;
+			goto out;
+		}
+	}
+	if (ferror(input)) {
+		result.status = SCADO_FILE_READ;
+		result.error_number = errno != 0 ? errno : EIO;
+		result.line = line_number + 1;
+	}
+
+out:
+	free(line);
+	if (input != NULL && fclose(input) != 0) {
+		if (result.status == SCADO_FILE_OK) {
+			result.status = SCADO_FILE_CLOSE_SOURCE;
+			result.error_number = errno;
+		} else if (result.cleanup_error == 0) {
+			result.cleanup_error = errno;
+		}
+	}
+	if (descriptor >= 0 && close(descriptor) < 0) {
+		if (result.status == SCADO_FILE_OK) {
+			result.status = SCADO_FILE_CLOSE_SOURCE;
+			result.error_number = errno;
+		} else if (result.cleanup_error == 0) {
+			result.cleanup_error = errno;
+		}
+	}
+	return result;
+}
+
+struct scado_file_result scado_delete_transaction(const char *path)
+{
+	struct scado_file_result result = { .status = SCADO_FILE_OK };
+	char directory[PATH_MAX];
+	int directory_fd = -1;
+	int directory_locked = 0;
+
+	if (path == NULL) {
+		result.status = SCADO_FILE_INVALID_ARGUMENT;
+		result.error_number = EINVAL;
+		return result;
+	}
+	if (destination_directory(path, directory) < 0) {
+		result.status = SCADO_FILE_OPEN_DIRECTORY;
+		result.error_number = errno;
+		return result;
+	}
+	directory_fd = open(directory, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+	if (directory_fd < 0) {
+		result.status = SCADO_FILE_OPEN_DIRECTORY;
+		result.error_number = errno;
+		return result;
+	}
+	if (flock(directory_fd, LOCK_EX) < 0) {
+		result.status = SCADO_FILE_LOCK_DIRECTORY;
+		result.error_number = errno;
+		goto out;
+	}
+	directory_locked = 1;
+	if (unlink(path) < 0) {
+		result.status = SCADO_FILE_REMOVE;
+		result.error_number = errno;
+		goto out;
+	}
+	result.committed = 1;
+	if (fsync(directory_fd) < 0) {
+		result.status = SCADO_FILE_SYNC_DIRECTORY;
+		result.error_number = errno;
+		goto out;
+	}
+	if (flock(directory_fd, LOCK_UN) < 0) {
+		result.status = SCADO_FILE_UNLOCK_DIRECTORY;
+		result.error_number = errno;
+		goto out;
+	}
+	directory_locked = 0;
+
+out:
+	if (directory_locked && flock(directory_fd, LOCK_UN) < 0) {
+		if (result.status == SCADO_FILE_OK) {
+			result.status = SCADO_FILE_UNLOCK_DIRECTORY;
+			result.error_number = errno;
+		} else if (result.cleanup_error == 0) {
+			result.cleanup_error = errno;
+		}
+	}
+	if (close(directory_fd) < 0) {
+		if (result.status == SCADO_FILE_OK) {
+			result.status = SCADO_FILE_CLOSE_DIRECTORY;
+			result.error_number = errno;
+		} else if (result.cleanup_error == 0) {
+			result.cleanup_error = errno;
+		}
+	}
+	return result;
+}
+
+struct scado_path_result scado_path_getinfo(const char *input_path,
+		const char *path)
+{
+	struct scado_path_result result = { .status = SCADO_FILE_OK };
+	int descriptor;
+	struct stat stats;
+	FILE *input = NULL;
+	char *line = NULL;
+	size_t capacity = 0;
+	ssize_t length;
+	size_t line_number = 0;
+
+	if (input_path == NULL || path == NULL || path[0] != '/') {
+		result.status = SCADO_FILE_INVALID_ARGUMENT;
+		result.error_number = EINVAL;
+		return result;
+	}
+	descriptor = open(input_path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+	if (descriptor < 0) {
+		result.status = SCADO_FILE_OPEN_SOURCE;
+		result.error_number = errno;
+		return result;
+	}
+	if (fstat(descriptor, &stats) < 0) {
+		result.status = SCADO_FILE_SOURCE_STAT;
+		result.error_number = errno;
+		if (close(descriptor) < 0)
+			result.cleanup_error = errno;
+		return result;
+	}
+	if (!S_ISREG(stats.st_mode)) {
+		result.status = SCADO_FILE_SOURCE_NOT_REGULAR;
+		result.error_number = EINVAL;
+		if (close(descriptor) < 0)
+			result.cleanup_error = errno;
+		return result;
+	}
+	input = fdopen(descriptor, "r");
+	if (input == NULL) {
+		result.status = SCADO_FILE_OPEN_SOURCE;
+		result.error_number = errno;
+		if (close(descriptor) < 0)
+			result.cleanup_error = errno;
+		return result;
+	}
+	while ((length = getline(&line, &capacity, input)) >= 0) {
+		struct scado_line parsed;
+		enum scado_parse_status parse_status;
+
+		line_number++;
+		parse_status = scado_parse_line(line, (size_t)length, 0, &parsed);
+		if (parse_status != SCADO_PARSE_OK) {
+			fprintf(stderr, "%s:%zu: %s\n", input_path, line_number,
+					scado_parse_status_string(parse_status));
+			result.status = SCADO_FILE_PARSE;
+			result.error_number = EINVAL;
+			result.line = line_number;
+			result.found = 0;
+			goto out;
+		}
+		if (!result.found && parsed.kind == SCADO_LINE_ENTRY &&
+				span_equal_string(parsed.path, path)) {
+			size_t i;
+
+			result.found = 1;
+			result.line = line_number;
+			result.capabilities = parsed.capability_set;
+			if (parsed.has_digest) {
+				for (i = 0; i < parsed.digest.length; i++)
+					result.digest[i] = (char)tolower(
+							(unsigned char)parsed.digest.data[i]);
+				result.digest[parsed.digest.length] = '\0';
+			}
+		}
+	}
+	if (ferror(input)) {
+		result.status = SCADO_FILE_READ;
+		result.error_number = errno != 0 ? errno : EIO;
+		result.found = 0;
+	}
+
+out:
+	free(line);
+	if (fclose(input) != 0) {
+		if (result.status == SCADO_FILE_OK) {
+			result.status = SCADO_FILE_CLOSE_SOURCE;
+			result.error_number = errno;
+			result.found = 0;
+		} else if (result.cleanup_error == 0) {
+			result.cleanup_error = errno;
+		}
+	}
+	return result;
+}
+
+const char *scado_file_status_string(enum scado_file_status status)
+{
+	switch (status) {
+	case SCADO_FILE_OK: return "scado operation succeeded";
+	case SCADO_FILE_INVALID_ARGUMENT: return "invalid scado operation";
+	case SCADO_FILE_OPEN_SOURCE: return "cannot open scado source";
+	case SCADO_FILE_SOURCE_STAT: return "cannot inspect scado source";
+	case SCADO_FILE_SOURCE_NOT_REGULAR: return "scado source is not a regular file";
+	case SCADO_FILE_OPEN_DIRECTORY: return "cannot open scado spool directory";
+	case SCADO_FILE_CREATE_STAGE: return "cannot create scado staging file";
+	case SCADO_FILE_STAGE_GUARD: return "cannot manage scado staging cleanup";
+	case SCADO_FILE_SET_CLOEXEC: return "cannot set staging close-on-exec";
+	case SCADO_FILE_SET_MODE: return "cannot set staging mode";
+	case SCADO_FILE_HASH_INIT: return "cannot initialize source hash";
+	case SCADO_FILE_HASH_UPDATE: return "cannot update source hash";
+	case SCADO_FILE_PARSE: return "invalid scado syntax";
+	case SCADO_FILE_READ: return "cannot read scado source";
+	case SCADO_FILE_WRITE: return "cannot write scado staging file";
+	case SCADO_FILE_DIGEST: return "cannot compute executable digest";
+	case SCADO_FILE_TARGET_MISSING: return "requested update path was not found";
+	case SCADO_FILE_TARGET_HAS_NO_DIGEST: return "requested update path has no digest field";
+	case SCADO_FILE_SOURCE_CHANGED: return "edited input changed after authentication";
+	case SCADO_FILE_SYNC_STAGE: return "cannot sync scado staging file";
+	case SCADO_FILE_CLOSE_SOURCE: return "cannot close scado source";
+	case SCADO_FILE_CLOSE_STAGE: return "cannot close scado staging file";
+	case SCADO_FILE_LOCK_DIRECTORY: return "cannot lock scado spool directory";
+	case SCADO_FILE_OPEN_DESTINATION: return "cannot inspect protected scado file";
+	case SCADO_FILE_DESTINATION_CHANGED: return "protected scado file changed during the operation";
+	case SCADO_FILE_RENAME: return "cannot install scado staging file";
+	case SCADO_FILE_REMOVE: return "cannot remove protected scado file";
+	case SCADO_FILE_SYNC_DIRECTORY: return "cannot sync scado spool directory";
+	case SCADO_FILE_UNLOCK_DIRECTORY: return "cannot unlock scado spool directory";
+	case SCADO_FILE_CLOSE_DIRECTORY: return "cannot close scado spool directory";
+	}
+	return "unknown scado file error";
+}
+
+void scado_report_file_failure(const struct scado_file_result *result)
+{
+	if (result == NULL)
+		return;
+	fprintf(stderr, "scado: %s", scado_file_status_string(result->status));
+	if (result->line != 0)
+		fprintf(stderr, " at line %zu", result->line);
+	if (result->error_number != 0)
+		fprintf(stderr, ": %s", strerror(result->error_number));
+	fputc('\n', stderr);
+	if (result->cleanup_error != 0)
+		fprintf(stderr, "scado: cleanup also failed: %s\n",
+				strerror(result->cleanup_error));
+	if (result->committed)
+		fprintf(stderr,
+				"scado: the protected file changed before the later failure\n");
+}

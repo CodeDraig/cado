@@ -1,67 +1,138 @@
-/* 
+/*
  * cado: execute a command in a capability ambient
- * Copyright (C) 2016  Renzo Davoli, University of Bologna
- * 
- * This file is part of cado.
+ * Copyright (C) 2016 Renzo Davoli, University of Bologna
  *
- * Cado is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License
- * as published by the Free Software Foundation; either version 2
- * of the License, or (at your option) any later version.
- * 
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- * 
- * You should have received a copy of the GNU General Public License
- * along with this program; If not, see <http://www.gnu.org/licenses/>. 
- *
+ * This file is part of cado and is distributed under the GNU GPL v2 or later.
  */
 
-#include <get_user_groups.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <unistd.h>
-#include <string.h>
 #include <grp.h>
 #include <pwd.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
 
-/* if the user does not exist get_user_groups returns NULL,
-	 otherwise it returns a dynamic allocated array whose
-	 first element (0) is the username of the current user.
-	 The following elements are the names of all the groups the current user belongs to.
-	 A NULL element tags the end of the array */
-char **get_user_groups(void) {
-	uid_t uid=getuid();
-	struct passwd *pwd=getpwuid(uid);
-	int ngroups=0;
-	char **user_groups=NULL;
-	if (pwd == NULL)
-		return NULL;
-	getgrouplist(pwd->pw_name, pwd->pw_gid, NULL, &ngroups);
-	if (ngroups > 0) {
-		gid_t gids[ngroups];
-		struct group *grp;
-		user_groups = calloc(ngroups+2, sizeof(char *));
-		if (user_groups) {
-			int i=0;
-			user_groups[i++] = strdup(pwd->pw_name);
-			if (getgrouplist(pwd->pw_name, pwd->pw_gid, gids, &ngroups) == ngroups) {
-				while ((grp=getgrent()) != NULL) {
-					int j;
-					for (j=0; j<ngroups; j++) {
-						if (grp->gr_gid == gids[j]) {
-							gids[j] = -1;
-							user_groups[i++] = strdup(grp->gr_name);
-						}
-					}
-				}
-				user_groups[i] = NULL;
-				endgrent();
-			}
-		}
-	}
-	return user_groups;
+#include <get_user_groups.h>
+
+void cado_identity_free(struct cado_identity *identity)
+{
+	size_t i;
+
+	if (identity == NULL)
+		return;
+	for (i = 0; i < identity->group_count; i++)
+		free(identity->groups[i]);
+	free(identity->groups);
+	free(identity->username);
+	identity->username = NULL;
+	identity->groups = NULL;
+	identity->group_count = 0;
 }
 
+enum cado_identity_status cado_identity_load(uid_t uid,
+		struct cado_identity *identity)
+{
+	struct passwd *password;
+	struct cado_identity loaded = {0};
+	gid_t *group_ids = NULL;
+	gid_t primary_group;
+	int group_count = 16;
+	int actual_count;
+	int i;
+
+	if (identity == NULL)
+		return CADO_IDENTITY_NO_MEMORY;
+	*identity = loaded;
+	password = getpwuid(uid);
+	if (password == NULL)
+		return CADO_IDENTITY_NO_PASSWD;
+	primary_group = password->pw_gid;
+	loaded.username = strdup(password->pw_name);
+	if (loaded.username == NULL)
+		return CADO_IDENTITY_NO_MEMORY;
+
+	for (;;) {
+		gid_t *resized;
+
+		if (group_count <= 0 ||
+				(size_t)group_count > SIZE_MAX / sizeof(*group_ids)) {
+			free(group_ids);
+			cado_identity_free(&loaded);
+			return CADO_IDENTITY_NO_MEMORY;
+		}
+		resized = realloc(group_ids, (size_t)group_count * sizeof(*group_ids));
+		if (resized == NULL) {
+			free(group_ids);
+			cado_identity_free(&loaded);
+			return CADO_IDENTITY_NO_MEMORY;
+		}
+		group_ids = resized;
+		actual_count = group_count;
+		if (getgrouplist(loaded.username, primary_group, group_ids,
+				&actual_count) >= 0)
+			break;
+		if (actual_count <= group_count) {
+			free(group_ids);
+			cado_identity_free(&loaded);
+			return CADO_IDENTITY_GROUP_LOOKUP;
+		}
+		group_count = actual_count;
+	}
+
+	if (actual_count < 0 ||
+			(size_t)actual_count > SIZE_MAX / sizeof(*loaded.groups)) {
+		free(group_ids);
+		cado_identity_free(&loaded);
+		return CADO_IDENTITY_NO_MEMORY;
+	}
+	loaded.groups = calloc((size_t)actual_count, sizeof(*loaded.groups));
+	if (actual_count > 0 && loaded.groups == NULL) {
+		free(group_ids);
+		cado_identity_free(&loaded);
+		return CADO_IDENTITY_NO_MEMORY;
+	}
+	for (i = 0; i < actual_count; i++) {
+		struct group *group = getgrgid(group_ids[i]);
+
+		if (group == NULL) {
+			free(group_ids);
+			cado_identity_free(&loaded);
+			return CADO_IDENTITY_GROUP_LOOKUP;
+		}
+		loaded.groups[loaded.group_count] = strdup(group->gr_name);
+		if (loaded.groups[loaded.group_count] == NULL) {
+			free(group_ids);
+			cado_identity_free(&loaded);
+			return CADO_IDENTITY_NO_MEMORY;
+		}
+		loaded.group_count++;
+	}
+	free(group_ids);
+	*identity = loaded;
+	return CADO_IDENTITY_OK;
+}
+
+int cado_identity_has_group(const struct cado_identity *identity,
+		const char *group)
+{
+	size_t i;
+
+	if (identity == NULL || group == NULL)
+		return 0;
+	for (i = 0; i < identity->group_count; i++) {
+		if (strcmp(identity->groups[i], group) == 0)
+			return 1;
+	}
+	return 0;
+}
+
+int cado_identity_matches_principal(const struct cado_identity *identity,
+		const char *principal)
+{
+	if (identity == NULL || principal == NULL || *principal == '\0')
+		return 0;
+	if (*principal == '@')
+		return principal[1] != '\0' &&
+			cado_identity_has_group(identity, principal + 1);
+	return strcmp(identity->username, principal) == 0;
+}

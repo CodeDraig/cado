@@ -1,0 +1,37 @@
+function(expect_status expected)
+	execute_process(COMMAND ${ARGN}
+		RESULT_VARIABLE actual
+		OUTPUT_QUIET ERROR_QUIET)
+	if(NOT actual EQUAL expected)
+		string(JOIN " " rendered ${ARGN})
+		message(FATAL_ERROR "${rendered}: expected ${expected}, got ${actual}")
+	endif()
+endfunction()
+
+expect_status(0 "${CMAKE_COMMAND}" -E env SHELL=/bin/true "${CADROP}")
+expect_status(0 "${CADROP}" all /bin/true)
+expect_status(0 "${CADROP}" - /bin/true)
+expect_status(0 "${CADROP}" 0 /bin/true)
+expect_status(2 "${CADROP}" "" /bin/true)
+expect_status(2 "${CADROP}" " " /bin/true)
+expect_status(2 "${CADROP}" -1 /bin/true)
+
+expect_status(0 "${CAPRINT}")
+expect_status(2 "${CAPRINT}" 0)
+expect_status(2 "${CAPRINT}" -1)
+expect_status(2 "${CAPRINT}" 12x)
+expect_status(2 "${CAPRINT}" 999999999999999999999)
+expect_status(1 "${CAPRINT}" -cl)
+expect_status(1 "${CAPRINT}" -h)
+
+expect_status(255 "${SCADO}" -u relative)
+expect_status(255 "${SCADO}" -l -e)
+expect_status(255 "${SCADO}" -l trailing)
+expect_status(255 "${SCADO}" -h)
+
+expect_status(2 "${CADO}" " " /bin/true)
+expect_status(1 "${CADO}" -S 0)
+expect_status(1 "${CADO}" -S 0 relative)
+expect_status(1 "${CADO}" -s -S)
+expect_status(1 "${CADO}" -s trailing)
+expect_status(1 "${CADO}" -h)

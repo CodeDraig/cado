@@ -1,140 +1,80 @@
-.TH SCADO 1 "June 23, 2016" "VirtualSquare Labs"
+.TH SCADO 1 "August 23, 2026" "VirtualSquare Labs"
 .SH NAME
-scado \- Script Capability Ambient DO
+scado \- manage per-user executable capability authorizations
 .SH SYNOPSIS
-.B scado
-.B -D
-|
-.B -e
+.B scado -e
 |
 .B -l
+|
+.B -D
 .br
-.B scado
-.B -u
-.I command
+.B scado -u
+.I /absolute/command
 |
 .B -U
-.br
-.B scado
-.B -h
-
 .SH DESCRIPTION
-
-\fBcado(1)\fR allows the system administrator to delegate capabilities to users.
-Users can grant a subset of these ambient capabilities to trusted programs.
-Each user can define their own list of trusted programs and which capabilities to grant, using a scado file.
-\fBcado -S\fR or \fBcado --scado\fR run those trusted programs without any further authentication.
-In this way it is also possible to run programs requiring specific capabilities within a bash script.
-
-\fBScado\fR is the command a user can run to create, edit, check or delete their own scado file.
-
-Each line of a scado file file has the following syntax:
-.br
-.RS 4
-.I path_of_the_executable_file : capability_list
-.RE
-.br
-or
-.br
-.RS 4
-.I path_of_the_executable_file : capability_list : sha256_digest_of_the_executable
-.RE
-.br
-(See the EXAMPLES section at the end of the man page for more info. All the trailing part of a line following a # sign is a comment.).
-
-The \fIpath_of_the_executable_file\fR must be absolute.
-
-The \fIcapability_list\fR is a comma separated list of capability names or capability
-masks.  For brevity, the \fBcap_\fR prefix of capabilities names can be omitted
-(e.g. \fBnet_admin\fR and \fBcap_net_admin\fR have the same meaning).
-
-The \fIsha256_digest_of_the_executable\fR prevents \fITOCTTOU\fR attacks. When a user
-wants to run the file at \fIpath_of_the_executable_file\fR granting it some of
-the capabilities in the \fIcapability_list\fR, the permission is denied if
-its sha256 digest does not match \fIsha256_digest_of_the_executable\fR.
-
-If there are only two colon (\fB:\fR) separated fields in a line, it means that
-the user trusts a priori the integrity of the file whose pathname is \fIpath_of_the_executable_file\fR.
-It can be, for example, a program in /bin or /usr/bin not modifiable by users.
-
-If there are three fields (i.e. two colon characters), it means that the user wants the
-cryptographic digest check on the executable file integrity.
-When a user edits their scado file, if the field (\fIsha256_digest_of_the_executable\fR) is empty, \fBscado\fR 
-computes it automatically when the scado file is saved.
-
-\fBScado\fR asks for user authentication by PAM to confirm any modification of the scado file.
-
-There is also a \fITOCTTOU\fR protection at running time: \fDcado -S\fR copies the executable file 
-in a safe place, where the user cannot change it, and runs it only if the integrity check on it succeeds.
-The user (or a malicious intruder acting as the user) cannot modify the file after the integrity check has completed
-and before the program is loaded.
-
+.B scado
+manages the current user's protected authorization file used by
+.BR "cado -S" .
+Exactly one action is required and trailing operands are rejected.
+.PP
+Each persisted noncomment entry has exactly two or three colon-delimited fields:
+.nf
+    absolute path : capability-list
+    absolute path : capability-list : 64-hexadecimal-character SHA-256
+.fi
+.PP
+An optional trailing
+.B #
+starts a comment. Field-edge whitespace is ignored. Internal path spaces are
+permitted and backslashes are literal. Paths must be absolute. Capability lists
+use the strict grammar described in
+.BR cado (1).
+A persisted digest is absent or exactly 64 hexadecimal characters; an empty
+persisted digest is invalid.
+.PP
+During
+.B scado -e
+only, an empty third field requests SHA-256 calculation. The value is filled
+before installation and never persists empty. After the editor exits, scado
+hashes the edited input, authenticates, then hashes the exact input consumed
+while rendering a mode-0600 staging file in the protected spool. It syncs the
+file, renames it atomically, and syncs the directory. A changed input, invalid
+line, digest failure, or output failure leaves the old scado file untouched.
+Every post-editor failure preserves and reports the editable recovery copy.
 .SH OPTIONS
-.I scado
-accepts the following options:
 .TP
-\fB\-l
-.TQ
-\fB\-\-list
-Display the current scado file. The actual file in the file system is not accessible by unprivileged users, for security reasons.
+.BR -e , " --edit"
+Edit with
+.BR $VISUAL ,
+then
+.BR $EDITOR ,
+then the configured default editor.
 .TP
-\fB\-e
-.TQ
-\fB\-\-edit
-Edit the scado file of the current user using the editor specified by either the
-\fBVISUAL\fR or the \fBEDITOR\fR environment variable (checked in that order).
-After you exit from the editor, the modified file will be installed automatically.
+.BR -l , " --list"
+Copy the current scado file to standard output without changing standard output
+flags.
 .TP
-\fB\-D
-.TQ
-\fB\-\-delete
-Delete the current user's scado file.
+.BR -D , " --delete"
+Authenticate and delete the current user's scado file.
 .TP
-\fB\-u\fR \fIcommand\fR
+.BI "-u " /absolute/command
 .TQ
-\fB\-\-update\fR \fIcommand\fR
-Recompute the hash of the line which starts with \fIcommand\fR.
+.BI "--update " /absolute/command
+Authenticate and recompute the matching persisted digest. A missing path or an
+entry without a digest is an error.
 .TP
-\fB\-U
-.TQ
-\fB\-\-update-all
-Update all the digest entries.
+.BR -U , " --update-all"
+Authenticate and recompute every persisted digest.
 .TP
-\fB\-h
-.TQ
-\fB\-\-help
-print a short usage banner and exit.
-
-.SH EXCEPTIONS FILES EXAMPLES
-
-.PP
-Allow \fBcado -S\fR to run /bin/ping providing it with the cap_net_raw capability, without any integrity check: 
-.RS 4
-/bin/ping : cap_net_raw
-.RE
-
-.PP
-Allow the activation of ping with cap_net_raw provided it has a specific SHA256 digest
-.RS 4
-/bin/ping : cap_net_raw : dcb237f1cb20ee7b1550900d1b524c554063fd17fc673c56d341736ced6bed4b
-.RE
-
-.PP
-Compute the SHA256 digest of (the current version of) ping so,
-allow the activation of ping with cap_net_raw provided it has not been modified.
-.RS 4
-/bin/ping : cap_net_raw :
-.RE
-
-.PP
-If one of the example lines here above has been inserted in the user scado file using
-\fBscado -e\fR, it is possible to execute ping as follows:
-.RS 4
-cado -S cap_net_raw /bin/ping
-.RE
-
+.BR -h , " --help"
+Print usage and exit.
+.SH EXAMPLE
+.nf
+    /bin/ping : cap_net_raw
+    /usr/local/bin/tool : net_admin : dcb237f1cb20ee7b1550900d1b524c554063fd17fc673c56d341736ced6bed4b
+    /opt/my tool : chown : # filled during scado -e
+.fi
 .SH SEE ALSO
-\fBcado\fR(1),
-\fBcapabilities\fR(7)
-
-
+.BR cado (1),
+.BR capabilities (7)

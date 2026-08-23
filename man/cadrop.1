@@ -1,30 +1,32 @@
-.TH CADROP 1 "November 26, 2016" "VirtualSquare Labs"
+.TH CADROP 1 "August 23, 2026" "VirtualSquare Labs"
 .SH NAME
-cadrop \- Capability Ambient Drop
+cadrop \- execute a command after dropping ambient capabilities
 .SH SYNOPSIS
 .B cadrop
 [
-.I capability_list
+.I capability-list | all | -
 [
 .I command
 [
-.I args
+.I args ...
 ]
 ]
 ]
-
 .SH DESCRIPTION
-Cadrop allows users to drop (ambient) capabilities.
-
-Cadrop launches the command indicated as a parameter ($SHELL if omitted) dropping all the capabilities 
-listed in the capability_list.
-
-If the capability_list is also omitted or it matches one of the string "all" or "-", cadrop drops all the capabilities.
-
+.B cadrop
+removes the selected ambient and inheritable capabilities, then executes the
+command. If the command is omitted it uses
+.BR $SHELL .
+.PP
+Omitting the capability argument, using
+.BR all ,
+or using
+.B -
+drops every ambient capability. These are the only all-capability forms; an empty
+string is invalid. A specific capability list uses the strict name/mask grammar
+documented in
+.BR cado (1).
 .SH SEE ALSO
-\fBcado\fR(1),
-\fBcaprint\fR(1),
-\fBscado\fR(1),
-\fBcado.conf\fR(5),
-\fBcapabilities\fR(7)
-
+.BR cado (1),
+.BR caprint (1),
+.BR capabilities (7)

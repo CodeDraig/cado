@@ -1,89 +1,80 @@
-.TH CADO 1 "June 23, 2016" "VirtualSquare Labs"
+.TH CADO 1 "August 23, 2026" "VirtualSquare Labs"
 .SH NAME
-cado \- Capability Ambient DO
+cado \- execute a command with authorized ambient capabilities
 .SH SYNOPSIS
 .B cado
 [
-.I OPTIONS
+.I options
 ]
-.I capability_list
+.I capability-list
 [
 .I command
 [
-.I args
+.I args ...
 ]
 ]
-
+.br
+.B cado -v
+.br
+.B cado -s
+[
+.B -v
+]
 .SH DESCRIPTION
-Cado allows the system administrator to delegate capabilities to users.
-Cado is a capability based sudo. Sudo allows authorized users to run programs as root (or as another user),
-cado allows authorized users to run programs with specific (ambient) capabilities.
-
-Cado is more selective than sudo, users can be authorized to have only specific capabilities (and not others).
-
-\fIcapability_list\fR is a comma separated list of capability names or capability masks (exadecimal numbers).
-For brevity, the \fBcap_\fR prefix of capability names can be omitted (e.g. \fBnet_admin\fR and \fBcap_net_admin\fR
-have the same meaning).
-
-If it is allowed for the current user to run processes with the requested capabilities, the user is asked to
-type their password (or to authenticate themselves as required by pam unless \fB-S\fR or \fB--scado\fR).
-Once the authentication succeeds, \fBcado\fR executes the command granting the required ambient capabilities.
-
-If \fIcommand\fR is omitted cado launch the command specified in the environment
-variable $SHELL.
-
-The file /etc/cado.conf (see \fBcado.conf\fR(5)) defines which capabilities can be provided by \fBcado\fR to each user.
-Cado itself is not a setuid executable, it uses the capability mechanism and it has an option to
-set its own capabilities. So after each change in the /etc/cado.conf, the capability set should be
-recomputed by root using the command \fBcado -s\fR or \fBcado --setcap\fR.
-
-When \fBcado\fR runs is scado mode (by the option \fB-S\fR or \fB--scado\fR), if
-.br
-\ \ - the current user is allowed to run processes with the requested capabilities, 
-.br 
-\ \ - the \fBcommand\fR argument is an absolute pathname and 
-.br 
-\ \ - there is a specific authorization line in the user's scado file,
-.br
-\fBcado\fR runs the command granting the required ambient capabilities without any further authentication request
-(it does not prompt for a password).
-.br
-
+.B cado
+delegates selected Linux ambient capabilities without changing the command to a
+root identity. Authorization is read from
+.BR cado.conf (5).
+For ordinary execution, PAM authenticates the current user after authorization
+and after cado drops its setuid identity.
+.PP
+.I capability-list
+is a comma-separated list of libcap names, with or without the
+.B cap_
+prefix, or unsigned unprefixed hexadecimal masks. Field-edge whitespace is
+ignored. Empty items, signs, overflow, trailing text, unsupported bits, and an
+empty list are errors.
+.PP
+If
+.I command
+is omitted, cado executes
+.BR $SHELL .
 .SH OPTIONS
-.I cado
-accepts the following options:
 .TP
-\fB\-v
-.TQ
-\fB\-\-verbose
-run in verbose mode. \fBcado\fR shows the set of allowed capabilities, requested cababilities, unavailable capabilities and
-(in case of -s) the set of capabilities assigned to \fBcado.conf\fR itself.
+.BR -f , " --force"
+Grant the intersection of requested and authorized capabilities. Without this
+option, any unavailable requested bit denies execution.
 .TP
-\fB\-f
-.TQ
-\fB\-\-force
-do not fail in case the user asks for unavailable capabilities,  \fBcado\fR in this case grants the intersection between the
-set of requested cababilities and the set of allowed capabilities
+.BR -v , " --verbose"
+Print capability sets. Used alone, list the capabilities authorized for the
+current identity.
 .TP
-\fB\-s
-.TQ
-\fB\-\-setcap
-\fBcado\fR computes the miminal set of capability required by itself and sets the file capability of the cado executable.
+.BR -S , " --scado"
+Require an explicit absolute command path and a matching per-user scado entry.
+No PAM prompt is made. A persisted digest causes cado to execute a protected,
+verified copy while preserving the original command as
+.IR argv[0] .
 .TP
-\fB\-S
-.TQ
-\fB\-\-scado
-launch \fBcado\fR with \fBscado\fR(1) support. \fIcommand\fR must be an absolute pathname and a specific authorization line must 
-appear in the user's scado file.
+.BR -s , " --setcap"
+As root, compute and apply cado's minimum file capability set from the complete
+configuration plus
+.BR cap_dac_read_search .
+This mode accepts no command or capability operands and is incompatible with
+.B -f
+and
+.BR -S .
 .TP
-\fB\-h
-.TQ
-\fB\-\-help
-print a short usage banner and exit.
-
+.BR -h , " --help"
+Print usage and exit.
+.SH SECURITY MODEL
+The installed cado executable is setuid to the unprivileged
+.B _cado
+account rather than UID 0. Its file capabilities are limited to configured
+delegations plus the capability needed to read protected configuration and scado
+files. Condition children drop ambient capabilities.
 .SH SEE ALSO
-\fBcado.conf\fR(5),
-\fBcaprint\fR(1),
-\fBscado\fR(1),
-\fBcapabilities\fR(7)
-
+.BR cado.conf (5),
+.BR scado (1),
+.BR cadrop (1),
+.BR caprint (1),
+.BR capabilities (7)

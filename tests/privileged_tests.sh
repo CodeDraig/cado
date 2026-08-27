@@ -133,7 +133,8 @@ cleanup() {
 		fi
 	fi
 	if [[ $group_created -eq 1 ]]; then
-		if ! groupdel "$test_group" >/dev/null 2>&1; then
+		if getent group "$test_group" >/dev/null 2>&1 &&
+				! groupdel "$test_group" >/dev/null 2>&1; then
 			printf 'FAIL: cannot remove test group %s\n' "$test_group" >&2
 			cleanup_failed=1
 		fi
@@ -261,8 +262,8 @@ EOF
 readonly editor="$fixture/write-scado"
 cat >"$editor" <<'EOF'
 #!/bin/sh
-printf '%s : chown :\n' "$CADO_TEST_SCADO_TARGET" >"$1"
-printf '%s : chown :\n' "$CADO_TEST_SHELL_TARGET" >>"$1"
+printf '%s : chown : \n' "$CADO_TEST_SCADO_TARGET" >"$1"
+printf '%s : chown : \n' "$CADO_TEST_SHELL_TARGET" >>"$1"
 EOF
 chmod 0755 "$editor"
 run_as_test env \

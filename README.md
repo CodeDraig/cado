@@ -32,8 +32,8 @@ $ ctest --test-dir build --output-on-failure
 
 Default tests are unprivileged and do not alter accounts, PAM configuration,
 installed programs, file capabilities, `/etc/cado.conf`, or scado spool data.
-See [TESTING.md](TESTING.md) for the verified regression boundaries and the
-projected or environment-dependent scenarios that still require dedicated runs.
+See [TESTING.md](TESTING.md) for the verified default and disposable-VM
+boundaries, the reproducible privileged command, and the PAM teardown limit.
 Privileged tests are disabled by default. They are registered only with both:
 
 ```console

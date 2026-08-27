@@ -26,6 +26,7 @@
 #include <scado_edit.h>
 #include <scado_parse.h>
 #include <scado_temp_guard.h>
+#include <set_ambient_cap.h>
 
 #define EDIT_PAM_MAX_TRIES 3
 
@@ -170,6 +171,8 @@ static int run_editor(const char *editor, const char *path,
 		if (restore_signals(old_actions) < 0)
 			_exit(255);
 		if (setgid(getgid()) < 0 || setuid(getuid()) < 0)
+			_exit(255);
+		if (drop_all_capabilities() < 0)
 			_exit(255);
 		parsed_editor = s2argv(editor);
 		if (parsed_editor == NULL)

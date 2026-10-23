@@ -1,0 +1,13 @@
+# Project metadata for work-catalog. Edit deliberately; refresh imports changes.
+schema_version = 1
+
+[project]
+id = "cado-cf910aaa"
+purpose = "Linux ambient-capability delegation and inspection utilities."
+state = "archived"
+next_action = "Use the documented entry point to select the next task; confirm owner intent before changing lifecycle. Runtime behavior was not tested."
+tags = ["C/C++", "repository", "xint"]
+
+[annotations]
+tags = []
+note = ""
